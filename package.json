@@ -1,8 +1,9 @@
 {
-  "name": "tracker-bot",
   "type": "module",
   "dependencies": {
     "discord.js": "^14.14.1",
-    "@supabase/supabase-js": "^2.39.0"
+    "@supabase/supabase-js": "^2.39.0",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
   }
 }
