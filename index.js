@@ -1,3 +1,4 @@
+
 import {
   Client,
   GatewayIntentBits,
@@ -6,132 +7,222 @@ import {
   Routes,
   EmbedBuilder
 } from "discord.js"
+
+import express from "express"
+import fetch from "node-fetch"
 import { createClient } from "@supabase/supabase-js"
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] })
+const app = express()
+app.use(express.json())
 
+// ===== SUPABASE =====
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 )
 
+// ===== ADMIN CHECK =====
+async function isAdmin(discordId) {
+  const { data } = await supabase
+    .from("admins")
+    .select("*")
+    .eq("discord_id", discordId)
+    .maybeSingle()
+  return !!data
+}
+
+// ===== PING ROUTE =====
+app.get("/ping", (_, res) => {
+  res.send("Bot is alive")
+})
+
+// ===== ROBLOX TRACK ROUTE =====
+app.post("/track", async (req, res) => {
+  const { player_id, username, display_name } = req.body
+
+  // --- BAN CHECK ---
+  const { data: ban } = await supabase
+    .from("bans")
+    .select("*")
+    .eq("player_id", player_id)
+    .maybeSingle()
+
+  if (ban?.expires_at && new Date(ban.expires_at) < new Date()) {
+    await supabase.from("bans").delete().eq("player_id", player_id)
+  }
+
+  if (ban) {
+    return res.json({ banned: true, reason: ban.reason })
+  }
+
+  // --- SAVE HISTORY ---
+  await supabase.from("executions").insert({
+    player_id,
+    username,
+    display_name
+  })
+
+  // --- WHITELIST CHECK ---
+  const { data: wl } = await supabase
+    .from("whitelist")
+    .select("*")
+    .eq("player_id", player_id)
+    .maybeSingle()
+
+  // --- SEND EMBED ONLY IF NOT WHITELIST ---
+  if (!wl) {
+    const embed = new EmbedBuilder()
+      .setTitle("🚨 Script Executed")
+      .setColor(0xff0000)
+      .addFields(
+        { name: "Username", value: username },
+        { name: "Display Name", value: display_name },
+        { name: "Player ID", value: player_id }
+      )
+      .setTimestamp()
+
+    const channel = await client.channels.fetch(process.env.LOG_CHANNEL)
+    channel.send({ embeds: [embed] })
+  }
+
+  res.json({ banned: false })
+})
+
+// ===== SERVER =====
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => console.log("Server running"))
+
+// ===== SELF PING (KEEP ALIVE) =====
+setInterval(async () => {
+  try {
+    await fetch(`${process.env.SELF_URL}/ping`)
+    console.log("Pinged self")
+  } catch {}
+}, 5 * 60 * 1000)
+
 // ===== SLASH COMMANDS =====
 const commands = [
   new SlashCommandBuilder()
+    .setName("ban")
+    .addStringOption(o => o.setName("playerid").setRequired(true))
+    .addStringOption(o => o.setName("reason").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("tempban")
+    .addStringOption(o => o.setName("playerid").setRequired(true))
+    .addIntegerOption(o => o.setName("minutes").setRequired(true))
+    .addStringOption(o => o.setName("reason").setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName("unban")
+    .addStringOption(o => o.setName("playerid").setRequired(true)),
+
+  new SlashCommandBuilder().setName("banlist"),
+  new SlashCommandBuilder().setName("clearbans"),
+
+  new SlashCommandBuilder()
     .setName("whitelist")
-    .setDescription("Whitelist controls")
     .addSubcommand(s =>
       s.setName("add")
-        .setDescription("Add user")
-        .addStringOption(o => o.setName("userid").setDescription("User ID").setRequired(true))
-        .addStringOption(o => o.setName("username").setDescription("Username").setRequired(true))
-        .addStringOption(o => o.setName("display").setDescription("Display name").setRequired(true))
-        .addStringOption(o => o.setName("playerid").setDescription("Player ID").setRequired(true))
-    )
+        .addStringOption(o => o.setName("playerid").setRequired(true)))
     .addSubcommand(s =>
       s.setName("remove")
-        .setDescription("Remove user")
-        .addStringOption(o => o.setName("userid").setDescription("User ID").setRequired(true))
-    ),
+        .addStringOption(o => o.setName("playerid").setRequired(true)))
+    .addSubcommand(s => s.setName("list")),
 
   new SlashCommandBuilder()
     .setName("history")
-    .setDescription("Execution history")
-    .addStringOption(o =>
-      o.setName("value").setDescription("username / display / player id").setRequired(true)
-    )
+    .addStringOption(o => o.setName("value").setRequired(true))
 ].map(c => c.toJSON())
 
 client.once("ready", async () => {
   const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN)
   await rest.put(Routes.applicationCommands(client.user.id), { body: commands })
-  console.log("Bot online & commands registered")
+  console.log("Bot ready")
 })
 
 // ===== COMMAND HANDLER =====
-client.on("interactionCreate", async interaction => {
-  if (!interaction.isChatInputCommand()) return
+client.on("interactionCreate", async i => {
+  if (!i.isChatInputCommand()) return
+  if (!(await isAdmin(i.user.id)))
+    return i.reply({
+      embeds: [new EmbedBuilder().setTitle("❌ Admin only").setColor(0xff0000)],
+      ephemeral: true
+    })
 
-  // WHITELIST
-  if (interaction.commandName === "whitelist") {
-    const sub = interaction.options.getSubcommand()
+  const pid = i.options.getString("playerid")
 
-    if (sub === "add") {
-      await supabase.from("whitelist").insert({
-        user_id: interaction.options.getString("userid"),
-        username: interaction.options.getString("username"),
-        display_name: interaction.options.getString("display"),
-        player_id: interaction.options.getString("playerid")
-      })
-
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("✅ User Whitelisted")
-            .setColor(0x00ff99)
-            .addFields(
-              { name: "Username", value: interaction.options.getString("username"), inline: true },
-              { name: "Display", value: interaction.options.getString("display"), inline: true },
-              { name: "Player ID", value: interaction.options.getString("playerid"), inline: true }
-            )
-            .setTimestamp()
-        ]
-      })
-    }
-
-    if (sub === "remove") {
-      await supabase.from("whitelist")
-        .delete()
-        .eq("user_id", interaction.options.getString("userid"))
-
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("❌ Removed from Whitelist")
-            .setColor(0xff5555)
-            .setTimestamp()
-        ]
-      })
-    }
+  if (i.commandName === "ban") {
+    await supabase.from("bans").upsert({
+      player_id: pid,
+      reason: i.options.getString("reason")
+    })
+    return i.reply({ embeds: [new EmbedBuilder().setTitle("🚫 Banned").setDescription(pid)] })
   }
 
-  // HISTORY
-  if (interaction.commandName === "history") {
-    const value = interaction.options.getString("value")
+  if (i.commandName === "tempban") {
+    const mins = i.options.getInteger("minutes")
+    const exp = new Date(Date.now() + mins * 60000)
+    await supabase.from("bans").upsert({
+      player_id: pid,
+      reason: i.options.getString("reason"),
+      expires_at: exp
+    })
+    return i.reply({ embeds: [new EmbedBuilder().setTitle("⏱ Tempbanned").setDescription(exp.toString())] })
+  }
 
+  if (i.commandName === "unban") {
+    await supabase.from("bans").delete().eq("player_id", pid)
+    return i.reply({ embeds: [new EmbedBuilder().setTitle("✅ Unbanned")] })
+  }
+
+  if (i.commandName === "banlist") {
+    const { data } = await supabase.from("bans").select("*")
+    return i.reply({
+      embeds: [new EmbedBuilder().setTitle("🚫 Ban List").setDescription(
+        data.map(b => `${b.player_id} | ${b.reason}`).join("\n") || "Empty"
+      )]
+    })
+  }
+
+  if (i.commandName === "clearbans") {
+    await supabase.from("bans").delete().neq("player_id", "")
+    return i.reply({ embeds: [new EmbedBuilder().setTitle("🧹 All bans cleared")] })
+  }
+
+  if (i.commandName === "whitelist") {
+    const sub = i.options.getSubcommand()
+    if (sub === "add") await supabase.from("whitelist").upsert({ player_id: pid })
+    if (sub === "remove") await supabase.from("whitelist").delete().eq("player_id", pid)
+    if (sub === "list") {
+      const { data } = await supabase.from("whitelist").select("player_id")
+      return i.reply({
+        embeds: [new EmbedBuilder().setTitle("Whitelist").setDescription(
+          data.map(x => x.player_id).join("\n") || "Empty"
+        )]
+      })
+    }
+    return i.reply({ embeds: [new EmbedBuilder().setTitle("Whitelist updated")] })
+  }
+
+  if (i.commandName === "history") {
+    const val = i.options.getString("value")
     const { data } = await supabase
       .from("executions")
       .select("*")
-      .or(`username.eq.${value},display_name.eq.${value},player_id.eq.${value}`)
+      .or(`player_id.eq.${val},username.eq.${val}`)
       .order("executed_at", { ascending: false })
       .limit(10)
 
-    if (!data || data.length === 0) {
-      return interaction.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle("❌ No History Found")
-            .setColor(0xff0000)
-        ]
-      })
-    }
-
-    const desc = data.map(
-      (e, i) =>
-        `**${i + 1}.** ${new Date(e.executed_at).toLocaleString()}
-User: ${e.username}
-Display: ${e.display_name}
-Player ID: ${e.player_id}`
-    ).join("\n\n")
-
-    interaction.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setTitle("📜 Execution History")
-          .setColor(0x0099ff)
-          .setDescription(desc)
-          .setTimestamp()
-      ]
+    return i.reply({
+      embeds: [new EmbedBuilder()
+        .setTitle("📜 Execution History")
+        .setDescription(
+          data.map(e =>
+            `${e.username} (${e.player_id})\n${new Date(e.executed_at).toLocaleString()}`
+          ).join("\n\n") || "No data"
+        )]
     })
   }
 })
